@@ -55,6 +55,7 @@ class CaptchaType(str, Enum):
     HCAPTCHA = "hcaptcha"          # hCaptcha
     RECAPTCHA_V2 = "userrecaptcha" # reCAPTCHA v2
     TURNSTILE = "turnstile"        # Cloudflare Turnstile
+    XCAPTCHA = "wcaptcha"          # xCaptcha widget
     COORD = "coord"                # Coordinate captcha
     BASE64 = "base64"              # Base64-encoded image
 
@@ -273,7 +274,7 @@ class UniversalCaptchaSolver:
             await self._solve_coord(task)
         elif task.captcha_type == CaptchaType.HCAPTCHA:
             await self._solve_hcaptcha(task)
-        elif task.captcha_type in (CaptchaType.RECAPTCHA_V2, CaptchaType.TURNSTILE):
+        elif task.captcha_type in (CaptchaType.RECAPTCHA_V2, CaptchaType.TURNSTILE, CaptchaType.XCAPTCHA):
             # Forward to dedicated solvers
             task.token = await self._forward_to_solver(task)
             task.status = "solved"
@@ -383,7 +384,7 @@ class UniversalCaptchaSolver:
 
     # ─── Forward to dedicated solvers ───
     async def _forward_to_solver(self, task: CaptchaTask) -> str:
-        """Forward reCAPTCHA/Turnstile tasks to dedicated solver servers"""
+        """Forward reCAPTCHA/Turnstile/xCaptcha tasks to dedicated solver servers"""
         import urllib.request
         import urllib.parse
 
@@ -404,6 +405,14 @@ class UniversalCaptchaSolver:
                 "sitekey": task.sitekey,
                 "pageurl": task.pageurl,
             }
+        elif task.captcha_type == CaptchaType.XCAPTCHA:
+            solver_url = os.environ.get("XCAPTCHA_SOLVER_URL", "http://172.17.0.1:8899")
+            params = {
+                "key": self.api_key,
+                "method": "wcaptcha",
+                "sitekey": task.sitekey,
+                "pageurl": task.pageurl,
+            }
         else:
             raise ValueError(f"Cannot forward type: {task.captcha_type}")
 
@@ -414,21 +423,38 @@ class UniversalCaptchaSolver:
         resp = urllib.request.urlopen(req, timeout=10)
         result = resp.read().decode()
 
-        if not result.startswith("OK|"):
+        # Handle both "OK|id" and JSON {"status":1,"request":"id"} responses
+        if result.startswith("{"):
+            import json as _json
+            jr = _json.loads(result)
+            if jr.get("status") != 1:
+                raise ValueError(f"Upstream submit failed: {result}")
+            task_id = jr["request"]
+        elif result.startswith("OK|"):
+            task_id = result.split("|", 1)[1]
+        else:
             raise ValueError(f"Upstream submit failed: {result}")
 
-        task_id = result.split("|", 1)[1]
-
-        # Poll for result
+        # Poll for result (handle both text and JSON responses)
         poll_url = f"{solver_url}/res.php?key={self.api_key}&id={task_id}"
         for _ in range(60):  # 5 min max
             await asyncio.sleep(5)
             try:
                 resp = urllib.request.urlopen(poll_url, timeout=10)
                 text = resp.read().decode()
-                if text.startswith("OK|"):
+                # JSON response
+                if text.startswith("{"):
+                    import json as _json
+                    jr = _json.loads(text)
+                    if jr.get("status") == 1:
+                        return jr["request"]
+                    req_val = jr.get("request", "")
+                    if "ERROR" in str(req_val):
+                        raise ValueError(f"Upstream error: {req_val}")
+                # Text response
+                elif text.startswith("OK|"):
                     return text.split("|", 1)[1]
-                if "ERROR" in text:
+                elif "ERROR" in text:
                     raise ValueError(f"Upstream error: {text}")
             except Exception as e:
                 if "ERROR" in str(e):
@@ -467,6 +493,8 @@ def create_app(solver: UniversalCaptchaSolver) -> web.Application:
             "userrecaptcha": CaptchaType.RECAPTCHA_V2,
             "recaptcha": CaptchaType.RECAPTCHA_V2,
             "turnstile": CaptchaType.TURNSTILE,
+            "wcaptcha": CaptchaType.XCAPTCHA,
+            "xcaptcha": CaptchaType.XCAPTCHA,
             "coord": CaptchaType.COORD,
         }
         captcha_type = method_map.get(method, CaptchaType.IMAGE_OCR)
