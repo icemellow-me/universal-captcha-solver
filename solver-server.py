@@ -157,6 +157,303 @@ class TesseractSolver:
             return ""
 
 
+class VlmOcrSolver:
+    """VLM-based OCR solver — supports Cloudflare Workers AI and NVIDIA APIs.
+    
+    Tier-3 fallback for when ddddocr and Tesseract both fail.
+    Excellent for distorted/noisy captchas, math captchas, and xCaptcha.
+    
+    Priority: Cloudflare Workers AI (free vision) > NVIDIA (free inference endpoint)
+    CF uses curl subprocess to bypass bot protection on direct HTTP.
+    """
+
+    def __init__(self, cf_api_token: str = "", cf_account_id: str = "",
+                 nvidia_api_key: str = "", model: str = ""):
+        self._cf_api_token = cf_api_token or os.environ.get("CF_API_TOKEN", "")
+        self._cf_account_id = cf_account_id or os.environ.get("CF_ACCOUNT_ID", "")
+        self._nvidia_api_key = nvidia_api_key or os.environ.get("NVIDIA_API_KEY", "")
+        self._cf_agreed = False
+        self._cf_model = "@cf/meta/llama-3.2-11b-vision-instruct"
+        self._nvidia_model = "meta/llama-3.2-90b-vision-instruct"
+        # Prefer CF when available (free vision)
+        if self._cf_api_token and self._cf_account_id:
+            self._provider = "cloudflare"
+            self._available = True
+            self._model = self._cf_model
+            log.info(f"VLM-OCR engine initialized (Cloudflare {self._cf_model})")
+        elif self._nvidia_api_key:
+            self._provider = "nvidia"
+            self._available = True
+            self._model = self._nvidia_model
+            log.info(f"VLM-OCR engine initialized (NVIDIA {self._nvidia_model})")
+        else:
+            self._provider = ""
+            self._available = False
+            log.warning("VLM-OCR disabled: needs CF_API_TOKEN+CF_ACCOUNT_ID or NVIDIA_API_KEY")
+
+    @property
+    def available(self):
+        return self._available
+
+    async def solve_text(self, image_bytes: bytes) -> str:
+        """Solve captcha image via VLM vision API.
+        
+        Sends the image to the vision model with an OCR-optimized prompt.
+        Returns extracted text or empty string on failure.
+        """
+        if not self._available:
+            return ""
+
+        if self._provider == "cloudflare":
+            return await self._solve_cf_text(image_bytes)
+        elif self._provider == "nvidia":
+            return await self._solve_nvidia_text(image_bytes)
+        return ""
+
+    async def _cf_ensure_agreement(self):
+        """Agree to CF Workers AI model license terms."""
+        if self._cf_agreed:
+            return
+        url = f"https://api.cloudflare.com/client/v4/accounts/{self._cf_account_id}/ai/run/{self._cf_model}"
+        proc = await asyncio.create_subprocess_exec(
+            "curl", "-s", "--max-time", "30", url,
+            "-H", f"Authorization: Bearer {self._cf_api_token}",
+            "-H", "Content-Type: application/json",
+            "-d", '{"prompt":"agree","max_tokens":10}',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=45)
+        data = json.loads(stdout.decode())
+        if data.get("success"):
+            self._cf_agreed = True
+            log.info("CF Workers AI model license agreed")
+        else:
+            errors = data.get("errors", [])
+            msg = errors[0].get("message", "") if errors else ""
+            if "agree" in msg.lower():
+                self._cf_agreed = True  # agreement prompt = not yet blocked
+                log.info("CF license agreement submitted")
+            else:
+                log.warning(f"CF agreement response: {msg[:100]}")
+                self._cf_agreed = True
+
+    async def _cf_call(self, payload: dict, timeout: int = 60) -> dict:
+        """Call CF Workers AI via curl subprocess (bypasses bot protection)."""
+        await self._cf_ensure_agreement()
+        url = f"https://api.cloudflare.com/client/v4/accounts/{self._cf_account_id}/ai/run/{self._cf_model}"
+        proc = await asyncio.create_subprocess_exec(
+            "curl", "-s", "--max-time", str(timeout), url,
+            "-H", f"Authorization: Bearer {self._cf_api_token}",
+            "-H", "Content-Type: application/json",
+            "-d", json.dumps(payload),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout + 15)
+        return json.loads(stdout.decode())
+
+    def _build_ocr_messages(self, data_uri: str) -> list:
+        """Build OCR-optimized messages for captcha solving."""
+        return [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "You are a CAPTCHA OCR solver. Look at this image carefully. "
+                            "It is a CAPTCHA challenge image containing text, numbers, or a math expression. "
+                            "Extract ONLY the characters/text shown in the image. "
+                            "Rules:\n"
+                            "- Output ONLY the raw text, nothing else\n"
+                            "- No explanations, no quotes, no formatting\n"
+                            "- If it's a math expression, provide the ANSWER (the number)\n"
+                            "- Include spaces only if they are clearly part of the text\n"
+                            "- Preserve case (uppercase/lowercase) exactly as shown\n"
+                            "What text/answer does this CAPTCHA show?"
+                        ),
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": data_uri},
+                    },
+                ],
+            }
+        ]
+
+    def _clean_ocr_result(self, text: str) -> str:
+        """Clean common model artifacts from OCR result."""
+        if not text:
+            return ""
+        text = text.strip()
+        text = re.sub(r'^["`]+|["`]+$', "", text)
+        text = re.sub(r"^(Answer|Result|Text|Solution|CAPTCHA)[:\s]*", "", text, flags=re.I)
+        return text.strip()
+
+    async def _solve_cf_text(self, image_bytes: bytes) -> str:
+        """Solve via Cloudflare Workers AI."""
+        b64 = base64.b64encode(image_bytes).decode()
+        mime = "image/png"
+        if image_bytes[:3] == b"\xff\xd8\xff":
+            mime = "image/jpeg"
+        elif image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
+            mime = "image/webp"
+        elif image_bytes[:4] == b"GIF8":
+            mime = "image/gif"
+
+        data_uri = f"data:{mime};base64,{b64}"
+        messages = self._build_ocr_messages(data_uri)
+        payload = {"messages": messages, "max_tokens": 50}
+
+        try:
+            data = await self._cf_call(payload, timeout=60)
+            if not data.get("success"):
+                errors = data.get("errors", [])
+                err = errors[0].get("message", "unknown") if errors else "unknown"
+                log.error(f"CF VLM-OCR error: {err[:200]}")
+                return ""
+            result = data.get("result", {})
+            text = result.get("response", "") if isinstance(result, dict) else str(result)
+            text = self._clean_ocr_result(text)
+            if text:
+                log.info(f"CF VLM-OCR result: {text}")
+            return text
+        except Exception as e:
+            log.error(f"CF VLM-OCR error: {e}")
+            return ""
+
+    async def _solve_nvidia_text(self, image_bytes: bytes) -> str:
+        """Solve via NVIDIA NIM API."""
+        import aiohttp
+
+        b64 = base64.b64encode(image_bytes).decode()
+        mime = "image/png"
+        if image_bytes[:3] == b"\xff\xd8\xff":
+            mime = "image/jpeg"
+        elif image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
+            mime = "image/webp"
+        elif image_bytes[:4] == b"GIF8":
+            mime = "image/gif"
+
+        data_uri = f"data:{mime};base64,{b64}"
+        messages = self._build_ocr_messages(data_uri)
+        payload = {
+            "model": self._nvidia_model,
+            "messages": messages,
+            "temperature": 0.1,
+            "max_tokens": 50,
+        }
+
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as session:
+                async with session.post(
+                    "https://integrate.api.nvidia.com/v1/chat/completions",
+                    json=payload,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {self._nvidia_api_key}",
+                        "Accept": "application/json",
+                    },
+                ) as resp:
+                    if resp.status != 200:
+                        err = await resp.text()
+                        log.error(f"NVIDIA VLM-OCR API error {resp.status}: {err[:200]}")
+                        return ""
+                    data = await resp.json()
+
+            text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            text = self._clean_ocr_result(text)
+            if text:
+                log.info(f"NVIDIA VLM-OCR result: {text}")
+            return text
+        except Exception as e:
+            log.error(f"NVIDIA VLM-OCR error: {e}")
+            return ""
+
+    async def solve_coord(self, image_bytes: bytes) -> str:
+        """Solve coordinate/click captcha via VLM — find targets in the image.
+        
+        Returns JSON array of [x, y] click coordinates.
+        """
+        if not self._available:
+            return ""
+
+        b64 = base64.b64encode(image_bytes).decode()
+        mime = "image/png"
+        if image_bytes[:3] == b"\xff\xd8\xff":
+            mime = "image/jpeg"
+
+        data_uri = f"data:{mime};base64,{b64}"
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Look at this CAPTCHA grid image. Find all the tiles/images that match "
+                            "the requested target. Return ONLY a JSON array of [x, y] coordinates "
+                            "representing the center of each matching tile. "
+                            "Use pixel coordinates relative to the full image. "
+                            "Example: [[120, 85], [280, 250]] or [] if none match. "
+                            "Output ONLY the JSON array, nothing else."
+                        ),
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": data_uri},
+                    },
+                ],
+            }
+        ]
+
+        try:
+            if self._provider == "cloudflare":
+                payload = {"messages": messages, "max_tokens": 200}
+                data = await self._cf_call(payload, timeout=60)
+                if not data.get("success"):
+                    return ""
+                result = data.get("result", {})
+                text = result.get("response", "") if isinstance(result, dict) else str(result)
+            else:
+                import aiohttp
+                payload = {
+                    "model": self._nvidia_model,
+                    "messages": messages,
+                    "temperature": 0.1,
+                    "max_tokens": 200,
+                }
+                async with aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as session:
+                    async with session.post(
+                        "https://integrate.api.nvidia.com/v1/chat/completions",
+                        json=payload,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {self._nvidia_api_key}",
+                            "Accept": "application/json",
+                        },
+                    ) as resp:
+                        if resp.status != 200:
+                            return ""
+                        data = await resp.json()
+                text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+            if text:
+                text = text.strip()
+                match = re.search(r'\[[\[\]\d,\s]+\]', text)
+                if match:
+                    return match.group(0)
+            return ""
+        except Exception as e:
+            log.error(f"VLM-OCR coord error: {e}")
+            return ""
+
+
 # ──────────────────────────────────────────────
 # hCaptcha Solver (ONNX-based)
 # ──────────────────────────────────────────────
@@ -216,7 +513,8 @@ class HcaptchaSolver:
 class UniversalCaptchaSolver:
     """Unified captcha solver with 2captcha-compatible HTTP API"""
 
-    def __init__(self, api_key: str, port: int = 8855, gemini_key: str = ""):
+    def __init__(self, api_key: str, port: int = 8855, gemini_key: str = "",
+                 cf_api_token: str = "", cf_account_id: str = ""):
         self.api_key = api_key
         self.port = port
         self.tasks: Dict[str, CaptchaTask] = {}
@@ -228,11 +526,14 @@ class UniversalCaptchaSolver:
         # Initialize solvers
         self._ddddocr = DdddOcrSolver()
         self._tesseract = TesseractSolver()
+        self._vlm_ocr = VlmOcrSolver(cf_api_token=cf_api_token, cf_account_id=cf_account_id)
         self._hcaptcha = HcaptchaSolver(gemini_key)
 
         log.info("Universal Captcha Solver initialized")
         log.info(f"  ddddocr: ✅")
         log.info(f"  Tesseract: {'✅' if self._tesseract.available else '❌'}")
+        vlm_provider = self._vlm_ocr._provider.upper() if self._vlm_ocr.available else "none"
+        log.info(f"  VLM-OCR ({vlm_provider}): {'✅' if self._vlm_ocr.available else '❌ (needs CF_API_TOKEN+CF_ACCOUNT_ID or NVIDIA_API_KEY)'}")
         log.info(f"  hCaptcha: {'✅' if self._hcaptcha.available else '❌ (needs GEMINI_API_KEY)'}")
 
     async def start(self):
@@ -318,7 +619,14 @@ class UniversalCaptchaSolver:
                 task.token = result
                 return
 
-        raise ValueError("Both OCR engines returned empty results")
+        # Tier-3: VLM-OCR via NVIDIA vision API (best for distorted/noisy/math captchas)
+        if self._vlm_ocr.available:
+            result = await self._vlm_ocr.solve_text(image_bytes)
+            if result:
+                task.token = result
+                return
+
+        raise ValueError("All OCR engines (ddddocr + Tesseract + VLM-OCR) returned empty results")
 
     # ─── Base64 image ───
     async def _solve_base64(self, task: CaptchaTask):
@@ -645,6 +953,8 @@ def create_app(solver: UniversalCaptchaSolver) -> web.Application:
             "engines": {
                 "ddddocr": True,
                 "tesseract": solver._tesseract.available,
+                "vlm_ocr": solver._vlm_ocr.available,
+                "vlm_provider": solver._vlm_ocr._provider,
                 "hcaptcha": solver._hcaptcha.available,
             },
         })
@@ -680,12 +990,16 @@ async def main():
     parser.add_argument("--api-key", required=True, help="API key for authentication")
     parser.add_argument("--port", type=int, default=8855, help="HTTP API port (default: 8855)")
     parser.add_argument("--gemini-key", default="", help="Google Gemini API key for hCaptcha")
+    parser.add_argument("--cf-api-token", default="", help="Cloudflare Workers AI API token (cfut_...)")
+    parser.add_argument("--cf-account-id", default="", help="Cloudflare account ID")
     args = parser.parse_args()
 
     solver = UniversalCaptchaSolver(
         api_key=args.api_key,
         port=args.port,
         gemini_key=args.gemini_key,
+        cf_api_token=args.cf_api_token,
+        cf_account_id=args.cf_account_id,
     )
 
     await solver.start()

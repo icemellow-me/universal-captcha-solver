@@ -8,8 +8,8 @@ Self-hosted, 2captcha-compatible captcha solving server. Handles **image OCR**, 
                         ┌─────────────────────────────────┐
                         │   Universal Solver (:8855)       │
   POST /in.php ───────►│   ddddocr + Tesseract OCR       │
-  GET  /res.php        │   hcaptcha-challenger + Gemini   │
-  POST /solve          │   Puter Vision LLM fallback      │
+  GET  /res.php        │   Cloudflare Workers AI Vision   │
+  POST /solve          │   hcaptcha-challenger + Gemini   │
                         │   + upstream forwarder           │
                         └──────┬──────────────┬───────────┘
                                │              │
@@ -21,6 +21,8 @@ Self-hosted, 2captcha-compatible captcha solving server. Handles **image OCR**, 
           │ Headless Chrome  │              │ CaptchaPlugin ext │
           └─────────────────┘              └──────────────────┘
 ```
+
+> **OCR Tier System:** ddddocr → Tesseract → **Cloudflare Workers AI Vision** (VLM fallback for hard captchas, math captchas, and xCaptcha)
 
 > **Chrome Extension** uses a **separate instance** on port **:8844** (with `json=1` support) that forwards to `:8833` (reCAPTCHA) and `:8822` (Turnstile). See [Extension-Specific Instance](#extension-specific-instance-json1).
 
@@ -425,6 +427,9 @@ docker run -d --name universal-captcha-solver \
 | Variable | Default | Description |
 |---|---|---|
 | `API_KEY` | — | Authentication key (also set via `--api-key` flag) |
+| `CF_API_TOKEN` | — | Cloudflare Workers AI token (cfut_... format) |
+| `CF_ACCOUNT_ID` | — | Cloudflare account ID for Workers AI |
+| `NVIDIA_API_KEY` | — | NVIDIA NIM API key (alternate VLM provider) |
 | `RECAPTCHA_SOLVER_URL` | — | URL of reCAPTCHA v2 solver for forwarding |
 | `TURNSTILE_SOLVER_URL` | — | URL of Turnstile solver for forwarding |
 | `PORT` (via `--port` flag) | `8855` | Server listen port |
@@ -432,7 +437,8 @@ docker run -d --name universal-captcha-solver \
 ### CLI Flags
 
 ```
-python3 solver-server.py --api-key YOUR_KEY --port 8855
+python3 solver-server.py --api-key YOUR_KEY --port 8855 \
+  --cf-api-token cfut_xxx --cf-account-id xxx
 ```
 
 ---
