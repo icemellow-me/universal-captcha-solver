@@ -11,15 +11,15 @@ Self-hosted, 2captcha-compatible captcha solving server. Handles **image OCR**, 
   GET  /res.php        │   Cloudflare Workers AI Vision   │
   POST /solve          │   hcaptcha-challenger + Gemini   │
                         │   + upstream forwarder           │
-                        └──────┬──────────────┬───────────┘
-                               │              │
-                    ┌──────────┘              └──────────┐
-                    ▼                                    ▼
-          ┌─────────────────┐              ┌──────────────────┐
-          │ Turnstile :8877 │              │ reCAPTCHA :8866   │
-          │ Playwright +     │              │ Playwright +      │
-          │ Headless Chrome  │              │ CaptchaPlugin ext │
-          └─────────────────┘              └──────────────────┘
+                        └──────┬──────────┬──────────┬───┘
+                               │          │          │
+                    ┌──────────┘          │          └──────────┐
+                    ▼                     ▼                     ▼
+          ┌─────────────────┐  ┌──────────────────┐  ┌──────────────────┐
+          │ Turnstile :8877 │  │ reCAPTCHA :8866   │  │ xCaptcha :8899   │
+          │ Playwright +     │  │ Playwright +      │  │ VLM + API leaks  │
+          │ Headless Chrome  │  │ CaptchaPlugin ext │  │ (2captcha-compat)│
+          └─────────────────┘  └──────────────────┘  └──────────────────┘
 ```
 
 > **OCR Tier System:** ddddocr → Tesseract → **Cloudflare Workers AI Vision** (VLM fallback for hard captchas, math captchas, and xCaptcha)
