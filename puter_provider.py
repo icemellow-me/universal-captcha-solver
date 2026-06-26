@@ -499,6 +499,7 @@ class CloudflareProvider:
             url,
             "-H", f"Authorization: Bearer {self._api_token}",
             "-H", "Content-Type: application/json",
+            "-H", "cf-model-agreement: true",
             "-d", json.dumps(payload),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -595,15 +596,21 @@ class CloudflareProvider:
                 self._last_response = data
                 result_data = data.get("result", {})
                 # Extract response text - could be in 'response' (prompt mode) or choices (messages mode)
+                # Note: CF API 'response' can be int/float/list/dict, not just str
                 text = ""
                 if isinstance(result_data, dict):
-                    text = result_data.get("response", "")
+                    raw_resp = result_data.get("response")
+                    if raw_resp is not None:
+                        text = str(raw_resp) if not isinstance(raw_resp, str) else raw_resp
                     if not text:
                         choices = result_data.get("choices", [])
                         if choices:
-                            text = choices[0].get("message", {}).get("content", "")
+                            content = choices[0].get("message", {}).get("content", "")
+                            text = content if isinstance(content, str) else str(content)
                 elif isinstance(result_data, str):
                     text = result_data
+                elif result_data is not None:
+                    text = str(result_data)
 
                 if not text:
                     raise ValueError(f"Empty response from CF Workers AI: {data}")
