@@ -16,7 +16,7 @@ Self-hosted, 2captcha-compatible captcha solving server. Handles **image OCR**, 
                     ┌──────────┘          │          └──────────┐
                     ▼                     ▼                     ▼
           ┌─────────────────┐  ┌──────────────────┐  ┌──────────────────┐
-          │ Turnstile :8877 │  │ reCAPTCHA :8866   │  │ xCaptcha :8899   │
+          │ Turnstile :8878 │  │ reCAPTCHA :8866   │  │ xCaptcha :8899   │
           │ Playwright +     │  │ Playwright +      │  │ VLM + API leaks  │
           │ Headless Chrome  │  │ CaptchaPlugin ext │  │ (2captcha-compat)│
           └─────────────────┘  └──────────────────┘  └──────────────────┘
@@ -381,11 +381,11 @@ The Chrome extension requires `json=1` support (2captcha spec). A **separate ins
 |---|---|---|
 | Universal Solver | **8844** | 8855 |
 | reCAPTCHA v2 | **8833** | 8866 |
-| Turnstile | **8822** | 8877 |
+| Turnstile | **8822** | 8878 |
 
 The extension-specific universal solver (`:8844`) forwards to `:8833` and `:8822` via the Docker gateway.
 
-**Original ports (8855/8866/8877)** return plain-text responses only — `OK|id`, `CAPCHA_NOT_READY`, etc. Use these for scripts and non-extension integrations.
+**Original ports (8855/8866/8878)** return plain-text responses only — `OK|id`, `CAPCHA_NOT_READY`, etc. Use these for scripts and non-extension integrations.
 
 **Extension ports (8844/8833/8822)** support `json=1` — pass `&json=1` (GET) or `-d "json=1"` (POST) to get structured JSON responses:
 - Submit: `{"status": 1, "request": "task_id"}` or `{"status": 0, "request": "ERROR_*"}`
@@ -418,7 +418,7 @@ docker build -t universal-captcha-solver .
 docker run -d --name universal-captcha-solver \
   -p 8855:8855 \
   -e RECAPTCHA_SOLVER_URL=http://172.17.0.1:8866 \
-  -e TURNSTILE_SOLVER_URL=http://172.17.0.1:8877 \
+  -e TURNSTILE_SOLVER_URL=http://172.17.0.1:8878 \
   universal-captcha-solver
 ```
 

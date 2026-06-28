@@ -706,7 +706,7 @@ class UniversalCaptchaSolver:
                 "pageurl": task.pageurl,
             }
         elif task.captcha_type == CaptchaType.TURNSTILE:
-            solver_url = os.environ.get("TURNSTILE_SOLVER_URL", "http://127.0.0.1:8877")
+            solver_url = os.environ.get("TURNSTILE_SOLVER_URL", "http://127.0.0.1:8878")
             params = {
                 "key": self.api_key,
                 "method": "turnstile",
