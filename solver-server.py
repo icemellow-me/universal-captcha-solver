@@ -27,6 +27,8 @@ import re
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
@@ -164,13 +166,13 @@ class VlmOcrSolver:
     Excellent for distorted/noisy captchas, math captchas, and xCaptcha.
     
     Priority: Cloudflare Workers AI (free vision) > NVIDIA (free inference endpoint)
-    CF uses curl subprocess to bypass bot protection on direct HTTP.
+    Uses Python urllib to avoid curl binary dependency.
     """
 
     def __init__(self, cf_api_token: str = "", cf_account_id: str = "",
                  nvidia_api_key: str = "", model: str = ""):
-        self._cf_api_token = cf_api_token or os.environ.get("CF_API_TOKEN", "")
-        self._cf_account_id = cf_account_id or os.environ.get("CF_ACCOUNT_ID", "")
+        self._cf_api_token = cf_api_token or os.environ.get("CF_API_TOKEN", os.environ.get("CLOUDFLARE_WORKERS_AI_TOKEN", ""))
+        self._cf_account_id = cf_account_id or os.environ.get("CF_ACCOUNT_ID", os.environ.get("CLOUDFLARE_ACCOUNT_ID", ""))
         self._nvidia_api_key = nvidia_api_key or os.environ.get("NVIDIA_API_KEY", "")
         self._cf_agreed = False
         self._cf_model = "@cf/meta/llama-3.2-11b-vision-instruct"
@@ -215,43 +217,58 @@ class VlmOcrSolver:
         if self._cf_agreed:
             return
         url = f"https://api.cloudflare.com/client/v4/accounts/{self._cf_account_id}/ai/run/{self._cf_model}"
-        proc = await asyncio.create_subprocess_exec(
-            "curl", "-s", "--max-time", "30", url,
-            "-H", f"Authorization: Bearer {self._cf_api_token}",
-            "-H", "Content-Type: application/json",
-            "-d", '{"prompt":"agree","max_tokens":10}',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=45)
-        data = json.loads(stdout.decode())
-        if data.get("success"):
-            self._cf_agreed = True
-            log.info("CF Workers AI model license agreed")
-        else:
-            errors = data.get("errors", [])
-            msg = errors[0].get("message", "") if errors else ""
-            if "agree" in msg.lower():
-                self._cf_agreed = True  # agreement prompt = not yet blocked
-                log.info("CF license agreement submitted")
-            else:
-                log.warning(f"CF agreement response: {msg[:100]}")
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps({"prompt": "agree", "max_tokens": 10}).encode(),
+                headers={
+                    "Authorization": f"Bearer {self._cf_api_token}",
+                    "Content-Type": "application/json",
+                    "cf-model-agreement": "true",
+                },
+                method="POST",
+            )
+            loop = asyncio.get_event_loop()
+            resp = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=30)),
+                timeout=45,
+            )
+            data = json.loads(resp.read().decode())
+            if data.get("success"):
                 self._cf_agreed = True
+                log.info("CF Workers AI model license agreed")
+            else:
+                self._cf_agreed = True
+                log.info("CF license agreement submitted")
+        except Exception:
+            self._cf_agreed = True
 
     async def _cf_call(self, payload: dict, timeout: int = 60) -> dict:
-        """Call CF Workers AI via curl subprocess (bypasses bot protection)."""
+        """Call CF Workers AI via urllib (works without curl binary)."""
         await self._cf_ensure_agreement()
         url = f"https://api.cloudflare.com/client/v4/accounts/{self._cf_account_id}/ai/run/{self._cf_model}"
-        proc = await asyncio.create_subprocess_exec(
-            "curl", "-s", "--max-time", str(timeout), url,
-            "-H", f"Authorization: Bearer {self._cf_api_token}",
-            "-H", "Content-Type: application/json",
-            "-d", json.dumps(payload),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout + 15)
-        return json.loads(stdout.decode())
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode(),
+                headers={
+                    "Authorization": f"Bearer {self._cf_api_token}",
+                    "Content-Type": "application/json",
+                    "cf-model-agreement": "true",
+                },
+                method="POST",
+            )
+            loop = asyncio.get_event_loop()
+            resp = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=timeout)),
+                timeout=timeout + 15,
+            )
+            return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode()
+            return {"success": False, "errors": [{"message": f"HTTP {e.code}: {body[:200]}"}]}
+        except Exception as e:
+            return {"success": False, "errors": [{"message": str(e)[:200]}]}
 
     def _build_ocr_messages(self, data_uri: str) -> list:
         """Build OCR-optimized messages for captcha solving."""
@@ -455,56 +472,561 @@ class VlmOcrSolver:
 
 
 # ──────────────────────────────────────────────
-# hCaptcha Solver (ONNX-based)
+# hCaptcha Solver (ONNX-based + LLM classifier)
 # ──────────────────────────────────────────────
-class HcaptchaSolver:
+
+def _extract_first_json_block(text) -> dict | None:
+    """Extract the first JSON object {...} from text (handles markdown fences)."""
+    # Handle non-string input (CF Workers AI may return dict)
+    if isinstance(text, dict):
+        return text
+    if not isinstance(text, str):
+        text = str(text)
+    # Strip markdown code fences
+    cleaned = re.sub(r"```(?:json)?\s*", "", text)
+    cleaned = cleaned.strip()
+    # Find first { ... }
+    start = cleaned.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    for i in range(start, len(cleaned)):
+        if cleaned[i] == "{":
+            depth += 1
+        elif cleaned[i] == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(cleaned[start : i + 1])
+                except (json.JSONDecodeError, ValueError):
+                    return None
+    return None
+
+
+class CloudflareWorkersProvider:
     """
-    hCaptcha solver using hcaptcha-challenger ONNX models.
-    Handles image_label_binary challenges (click matching images).
+    ChatProvider implementation for Cloudflare Workers AI.
+    
+    Implements the hcaptcha-challenger ChatProvider protocol so that
+    CF Workers AI (vision models) can be used instead of Gemini for
+    hCaptcha image classification tasks.
+    
+    Supported models:
+      - @cf/meta/llama-3.2-11b-vision-instruct (default, free, vision)
+      - Fallback to @cf/meta/llama-3.1-70b-instruct for text/routing tasks
+      - Any CF Workers AI vision model
     """
 
-    def __init__(self, gemini_api_key: str = ""):
-        self._api_key = gemini_api_key or os.environ.get("GEMINI_API_KEY", "")
-        self._agent = None
+    def __init__(self, api_token: str, account_id: str, model: str = "",
+                 fallback_model: str = ""):
+        self._api_token = api_token
+        self._account_id = account_id
+        self._model = model or os.environ.get(
+            "CF_HCAPTCHA_MODEL", "@cf/meta/llama-3.2-11b-vision-instruct"
+        )
+        # Stronger text model for routing/structured output (no vision needed)
+        self._fallback_model = fallback_model or os.environ.get(
+            "CF_HCAPTCHA_FALLBACK_MODEL", "@cf/meta/llama-3.1-70b-instruct"
+        )
+        self._cf_agreed_models = set()
+        self._last_response_text = ""
+        log.info(
+            f"CF Workers AI provider initialized (model={self._model}, fallback={self._fallback_model})"
+        )
+
+    @property
+    def last_response(self) -> str:
+        """Get the last raw response text for debugging."""
+        return self._last_response_text
+
+    async def _ensure_agreement(self, model: str = None):
+        """Agree to CF Workers AI model license terms (required first call)."""
+        model = model or self._model
+        if model in self._cf_agreed_models:
+            return
+        url = (
+            f"https://api.cloudflare.com/client/v4/accounts/"
+            f"{self._account_id}/ai/run/{model}"
+        )
         try:
-            from hcaptcha_challenger import AgentV
+            req = urllib.request.Request(
+                url,
+                data=json.dumps({"prompt": "agree", "max_tokens": 10}).encode(),
+                headers={
+                    "Authorization": f"Bearer {self._api_token}",
+                    "Content-Type": "application/json",
+                    "cf-model-agreement": "true",
+                },
+                method="POST",
+            )
+            loop = asyncio.get_event_loop()
+            resp = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=30)),
+                timeout=45,
+            )
+            data = json.loads(resp.read().decode())
+            if data.get("success"):
+                self._cf_agreed_models.add(model)
+                log.info(f"CF Workers AI model license agreed ({model})")
+            else:
+                self._cf_agreed_models.add(model)
+                log.info(f"CF license agreement submitted ({model})")
+        except Exception:
+            self._cf_agreed_models.add(model)
+
+    async def _cf_call(self, payload: dict, timeout: int = 90, model: str = None) -> dict:
+        """Call CF Workers AI via urllib (works without curl binary)."""
+        model = model or self._model
+        await self._ensure_agreement(model)
+        url = (
+            f"https://api.cloudflare.com/client/v4/accounts/"
+            f"{self._account_id}/ai/run/{model}"
+        )
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode(),
+                headers={
+                    "Authorization": f"Bearer {self._api_token}",
+                    "Content-Type": "application/json",
+                    "cf-model-agreement": "true",
+                },
+                method="POST",
+            )
+            loop = asyncio.get_event_loop()
+            resp = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, lambda: urllib.request.urlopen(req, timeout=timeout)
+                ),
+                timeout=timeout + 15,
+            )
+            return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode()
+            return {"success": False, "errors": [{"message": f"HTTP {e.code}: {body[:200]}"}]}
+        except Exception as e:
+            return {"success": False, "errors": [{"message": str(e)[:200]}]}
+
+    def _images_to_messages(
+        self, images: list, user_prompt: str | None = None, description: str | None = None
+    ) -> list:
+        """Build OpenAI-compatible messages with base64 images for CF Workers AI."""
+        content_parts = []
+        for img_path in images:
+            try:
+                p = str(img_path)
+                img_bytes = open(p, "rb").read()
+                b64 = base64.b64encode(img_bytes).decode()
+                mime = "image/png"
+                if img_bytes[:3] == b"\xff\xd8\xff":
+                    mime = "image/jpeg"
+                elif img_bytes[:4] == b"RIFF" and img_bytes[8:12] == b"WEBP":
+                    mime = "image/webp"
+                elif img_bytes[:4] == b"GIF8":
+                    mime = "image/gif"
+                data_uri = f"data:{mime};base64,{b64}"
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": data_uri},
+                })
+            except Exception as e:
+                log.warning(f"Failed to read image {img_path}: {e}")
+
+        # Add text prompt last (model processes images then text instructions)
+        prompt_text = user_prompt or "Analyze this image."
+        if description:
+            prompt_text = f"{description}\n\n{prompt_text}"
+        content_parts.append({"type": "text", "text": prompt_text})
+
+        # Build system + user messages in OpenAI format
+        messages = []
+        if description and not user_prompt:
+            messages.append({"role": "system", "content": description})
+        messages.append({"role": "user", "content": content_parts})
+        return messages
+
+    async def generate_with_images(
+        self,
+        *,
+        images: list,
+        response_schema: type = None,
+        user_prompt: str | None = None,
+        description: str | None = None,
+        **kwargs,
+    ):
+        """
+        Generate content with image inputs via CF Workers AI.
+        
+        Implements the ChatProvider protocol from hcaptcha-challenger.
+        Sends images + prompts to CF Workers AI, then parses the structured 
+        JSON response into the given Pydantic response_schema.
+        
+        Strategy:
+        - For ChallengeRouterResult (text classification): use the stronger 
+          fallback model (llama-3.1-70b-instruct) first — no vision needed.
+        - For image classification (coordinates): use the vision model.
+        - If the model echoes the schema back instead of actual data, retry
+          with a simpler prompt or fallback to a stronger model.
+        
+        Args:
+            images: List of image file paths.
+            response_schema: Pydantic model class for structured output.
+            user_prompt: User-provided prompt/instructions.
+            description: System instruction/description for the model.
+            **kwargs: Additional provider-specific options.
+            
+        Returns:
+            Parsed response matching the response_schema type.
+        """
+        # Determine if this is a text-only task (no vision needed)
+        schema_name = getattr(response_schema, "__name__", "") if response_schema else ""
+        is_routing_task = (schema_name == "ChallengeRouterResult")
+        use_fallback = is_routing_task and self._fallback_model
+        
+        # For routing tasks, try the stronger fallback model first (text-only, better at JSON)
+        if use_fallback:
+            log.info(f"Using fallback model ({self._fallback_model}) for {schema_name}")
+            routing_prompt = (
+                f"{user_prompt or 'Classify the challenge.'}\n\n"
+                f"Respond ONLY with a JSON object like: "
+                f'{{"challenge_prompt": "the prompt text", "challenge_type": "image_label_binary"}}\n'
+                f"Valid types: image_label_single_select, image_label_multi_select, "
+                f"image_label_binary, image_drag_single, image_drag_multi"
+            )
+            fallback_messages = [
+                {"role": "system", "content": "You are a captcha challenge classifier. Respond ONLY with valid JSON."},
+                {"role": "user", "content": routing_prompt},
+            ]
+            fallback_payload = {
+                "messages": fallback_messages,
+                "max_tokens": 256,
+                "temperature": 0.1,
+            }
+            try:
+                data = await self._cf_call(fallback_payload, timeout=60, model=self._fallback_model)
+                if data.get("success"):
+                    result = data.get("result", {})
+                    raw = result.get("response", "") if isinstance(result, dict) else str(result)
+                    if isinstance(raw, dict):
+                        raw = json.dumps(raw)
+                    text = raw if isinstance(raw, str) else str(raw)
+                    json_data = _extract_first_json_block(text)
+                    if json_data and isinstance(json_data, dict) and "challenge_type" in json_data:
+                        self._last_response_text = text
+                        return response_schema(**json_data)
+                    log.warning(f"Fallback model returned unparseable response: {text[:100]}")
+            except Exception as e:
+                log.warning(f"Fallback model error (will try vision model): {e}")
+        
+        # Build prompt that enforces JSON schema output
+        schema_hint = ""
+        if response_schema and hasattr(response_schema, "model_json_schema"):
+            schema_def = response_schema.model_json_schema()
+            # For small vision models, use a lighter schema hint to avoid echo
+            if is_routing_task:
+                schema_hint = (
+                    f"\\n\\nRespond with ONLY a JSON object: "
+                    f'{{"challenge_prompt": "the prompt", "challenge_type": "image_label_binary"}}'
+                )
+            else:
+                schema_hint = (
+                    f"\\n\\nYou MUST respond with valid JSON matching this schema:\\n"
+                    f"{json.dumps(schema_def, indent=2)}\\n"
+                    f"Output ONLY the JSON object, no markdown, no explanation."
+                )
+
+        enhanced_prompt = (user_prompt or "Analyze this image.") + schema_hint
+        messages = self._images_to_messages(images, enhanced_prompt, description)
+
+        payload = {
+            "messages": messages,
+            "max_tokens": 1024,
+            "temperature": 0.1,
+        }
+
+        try:
+            data = await self._cf_call(payload, timeout=90)
+            if not data.get("success"):
+                errors = data.get("errors", [])
+                err = errors[0].get("message", "unknown") if errors else "unknown"
+                log.error(f"CF Workers AI hCaptcha error: {err[:200]}")
+                raise RuntimeError(f"CF Workers AI error: {err[:200]}")
+
+            result = data.get("result", {})
+            # CF Workers AI may return response as dict (structured) or string
+            raw_response = result.get("response", "") if isinstance(result, dict) else str(result)
+            # Ensure text is always a string
+            if isinstance(raw_response, dict):
+                self._last_response_text = json.dumps(raw_response)
+            elif isinstance(raw_response, str):
+                self._last_response_text = raw_response
+            else:
+                self._last_response_text = str(raw_response)
+            text = self._last_response_text
+
+            if not text:
+                raise ValueError("Empty response from CF Workers AI")
+
+            # Parse into the response schema
+            json_data = _extract_first_json_block(text)
+            if json_data and response_schema:
+                # Check if the model returned a schema definition instead of actual data
+                if isinstance(json_data, dict):
+                    # Schema echo: model returned $defs/properties instead of challenge_type/challenge_prompt
+                    if "$defs" in json_data and "challenge_type" not in json_data:
+                        log.warning("CF model returned schema definition instead of actual result, retrying without schema hint")
+                        # Retry without schema hint in the prompt
+                        simple_payload = {
+                            "messages": [
+                                {"role": "system", "content": "You are a captcha classifier. Respond ONLY with valid JSON."},
+                                {"role": "user", "content": f"{user_prompt or 'Classify the image.'}\n\nRespond with JSON: {{\"challenge_type\": \"image_label_binary\", \"challenge_prompt\": \"description\"}}"}
+                            ],
+                            "max_tokens": 256,
+                            "temperature": 0.1,
+                        }
+                        simple_payload["messages"][1]["content"] += "\n\nThe image shows an hCaptcha grid challenge. What type is it?"
+                        data2 = await self._cf_call(simple_payload, timeout=60)
+                        result2 = data2.get("result", {})
+                        raw2 = result2.get("response", "") if isinstance(result2, dict) else str(result2)
+                        if isinstance(raw2, dict):
+                            raw2 = json.dumps(raw2)
+                        text2 = raw2 if isinstance(raw2, str) else str(raw2)
+                        json_data2 = _extract_first_json_block(text2)
+                        if json_data2 and isinstance(json_data2, dict) and "challenge_type" in json_data2:
+                            return response_schema(**json_data2)
+                        
+                        # Final fallback: default to most common type
+                        log.warning("ChallengeRouter fallback: defaulting to image_label_binary")
+                        if response_schema.__name__ == "ChallengeRouterResult":
+                            return response_schema(challenge_type="image_label_binary", challenge_prompt="Click on the matching objects")
+                    try:
+                        return response_schema(**json_data)
+                    except Exception:
+                        pass
+
+            # Fallback: try direct JSON parse
+            if response_schema:
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, dict):
+                        return response_schema(**parsed)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+            raise ValueError(
+                f"Failed to parse CF response as {response_schema}: {text[:300]}"
+            )
+
+        except RuntimeError:
+            raise
+        except Exception as e:
+            log.error(f"CF Workers AI provider error: {e}")
+            raise
+
+
+class HcaptchaSolver:
+    """
+    hCaptcha solver using hcaptcha-challenger.
+    
+    Supports two LLM backends for image classification:
+    1. Google Gemini (default — needs GEMINI_API_KEY)
+    2. Cloudflare Workers AI (alternative — needs CF_API_TOKEN + CF_ACCOUNT_ID)
+    
+    The solver uses Playwright to navigate the hCaptcha challenge page,
+    then uses the LLM to classify which grid cells to click.
+    
+    Usage:
+        # With Gemini
+        solver = HcaptchaSolver(gemini_api_key="AIza...")
+        
+        # With Cloudflare Workers AI
+        solver = HcaptchaSolver(
+            cf_api_token="cfut_...",
+            cf_account_id="abc123...",
+        )
+    """
+
+    def __init__(self, gemini_api_key: str = "",
+                 cf_api_token: str = "", cf_account_id: str = "",
+                 cf_model: str = ""):
+        self._gemini_key = gemini_api_key or os.environ.get("GEMINI_API_KEY", "")
+        self._cf_api_token = cf_api_token or os.environ.get("CF_API_TOKEN", os.environ.get("CLOUDFLARE_WORKERS_AI_TOKEN", ""))
+        self._cf_account_id = cf_account_id or os.environ.get("CF_ACCOUNT_ID", os.environ.get("CLOUDFLARE_ACCOUNT_ID", ""))
+        self._cf_model = cf_model or os.environ.get("CF_HCAPTCHA_MODEL", "")
+        self._provider = "none"
+        self._agent_cls = None
+        self._cf_provider = None
+
+        # Try loading hcaptcha-challenger
+        try:
+            from hcaptcha_challenger import AgentV, AgentConfig
             self._agent_cls = AgentV
-            self._zero_shot_cls = None
-            log.info(f"hCaptcha challenger loaded (gemini={'yes' if self._api_key else 'no'})")
+            self._config_cls = AgentConfig
         except Exception as e:
             log.warning(f"hcaptcha-challenger not available: {e}")
-            self._agent_cls = None
+            return
+
+        # Determine provider
+        if self._gemini_key:
+            self._provider = "gemini"
+            log.info(f"hCaptcha: using Gemini (key={self._gemini_key[:8]}...)")
+        elif self._cf_api_token and self._cf_account_id:
+            self._provider = "cloudflare"
+            self._cf_provider = CloudflareWorkersProvider(
+                api_token=self._cf_api_token,
+                account_id=self._cf_account_id,
+                model=self._cf_model,
+            )
+            log.info(f"hCaptcha: using Cloudflare Workers AI (model={self._cf_provider._model})")
+        else:
+            log.warning("hCaptcha: no LLM provider configured (needs GEMINI_API_KEY or CF_API_TOKEN+CF_ACCOUNT_ID)")
 
     @property
     def available(self):
-        return self._agent_cls is not None
+        return self._agent_cls is not None and self._provider != "none"
 
     async def solve_hcaptcha(
         self,
         sitekey: str,
         pageurl: str,
-        browser_context=None,
     ) -> str:
-        """Solve hCaptcha using Playwright + hcaptcha-challenger"""
+        """Solve hCaptcha challenge using Playwright + hcaptcha-challenger.
+        
+        The solver navigates to the page with hCaptcha, clicks the checkbox,
+        then uses the LLM provider (Gemini or CF Workers AI) to classify
+        which grid cells to click in the image challenge.
+        """
         if not self.available:
-            raise RuntimeError("hcaptcha-challenger not installed")
-        if not self._api_key:
-            raise RuntimeError("GEMINI_API_KEY required for hcaptcha-challenger")
+            raise RuntimeError(
+                "hcaptcha-challenger not installed or no LLM provider configured "
+                "(needs GEMINI_API_KEY or CF_API_TOKEN+CF_ACCOUNT_ID)"
+            )
 
         try:
-            from hcaptcha_challenger import AgentV
+            from hcaptcha_challenger import AgentV, AgentConfig
             from playwright.async_api import async_playwright
+            from playwright_stealth import Stealth
 
-            agent = AgentV(
-                api_key=self._api_key,
-                sitekey=sitekey,
-                pageurl=pageurl,
-            )
-            result = await agent.handle()
-            return result or ""
+            # Build AgentConfig with the appropriate provider
+            if self._provider == "gemini":
+                config = AgentConfig(GEMINI_API_KEY=self._gemini_key)
+            else:
+                # Cloudflare — we need to inject our provider into the classifiers
+                # AgentConfig still needs a dummy GEMINI_API_KEY to pass validation
+                config = AgentConfig(GEMINI_API_KEY="cf-placeholder")
+
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                    ],
+                )
+                context = await browser.new_context(
+                    viewport={"width": 1280, "height": 720},
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/125.0.0.0 Safari/537.36"
+                    ),
+                )
+                page = await context.new_page()
+                stealth_config = Stealth(navigator_webdriver=True, navigator_plugins=True, navigator_platform_override="Win32")
+                await stealth_config.apply_stealth_async(page)
+
+                # If using CF Workers AI, monkey-patch the provider into classifiers
+                if self._provider == "cloudflare" and self._cf_provider:
+                    self._patch_cf_provider(config)
+
+                try:
+                    # Navigate to the page and click the hCaptcha checkbox
+                    await page.goto(pageurl, wait_until="domcontentloaded", timeout=30000)
+                    await page.wait_for_timeout(3000)
+
+                    # Try to click the hCaptcha checkbox to trigger the challenge
+                    try:
+                        checkbox = page.frame_locator("iframe[src*='hcaptcha.com']").first
+                        await checkbox.locator("#checkbox").click(timeout=10000)
+                        log.info("Clicked hCaptcha checkbox")
+                        await page.wait_for_timeout(3000)
+                    except Exception as e:
+                        log.info(f"hCaptcha checkbox click: {e} (proceeding anyway)")
+
+                    agent = AgentV(page=page, agent_config=config)
+                    result = await agent.wait_for_challenge()
+
+                    if result.name == "SUCCESS":
+                        # Extract the hCaptcha response token from the page
+                        token = await page.evaluate(
+                            """() => {
+                                const el = document.querySelector('[name="h-captcha-response"]');
+                                return el ? el.value : '';
+                            }"""
+                        )
+                        if token:
+                            log.info("hCaptcha solved successfully")
+                            return token
+                    
+                    log.warning(f"hCaptcha challenge result: {result.name}")
+                    return ""
+
+                finally:
+                    await browser.close()
+
         except Exception as e:
-            log.error(f"hCaptcha agent error: {e}")
+            log.error(f"hCaptcha solve error: {e}")
             raise
+
+    def _patch_cf_provider(self, config: "AgentConfig"):
+        """Monkey-patch Cloudflare Workers AI provider into hcaptcha-challenger classifiers.
+        
+        This replaces the Gemini-based ImageClassifier, ChallengeClassifier,
+        and spatial reasoners with our CF Workers AI provider.
+        """
+        import hcaptcha_challenger.tools.image_classifier as ic_mod
+        import hcaptcha_challenger.tools.challenge_router as cr_mod
+        import hcaptcha_challenger.tools.spatial as sp_mod
+
+        cf = self._cf_provider
+
+        # Patch ImageClassifier to use CF provider
+        original_ic_init = ic_mod.ImageClassifier.__init__
+        def patched_ic_init(self_ic, gemini_api_key, model=None, *, provider=None, **kwargs):
+            # Force our CF provider
+            original_ic_init(self_ic, gemini_api_key="cf-placeholder", model=model, provider=cf, **kwargs)
+        ic_mod.ImageClassifier.__init__ = patched_ic_init
+
+        # Patch ChallengeRouter similarly
+        try:
+            original_cr_init = cr_mod.ChallengeRouter.__init__
+            def patched_cr_init(self_cr, gemini_api_key, model=None, *, provider=None, **kwargs):
+                original_cr_init(self_cr, gemini_api_key="cf-placeholder", model=model, provider=cf, **kwargs)
+            cr_mod.ChallengeRouter.__init__ = patched_cr_init
+        except (AttributeError, ImportError):
+            pass
+
+        # Patch spatial reasoners
+        try:
+            for mod_name in ["point", "bbox", "path"]:
+                sp_sub = getattr(sp_mod, mod_name, None)
+                if sp_sub is None:
+                    continue
+                for cls_name in ["SpatialPointReasoner", "SpatialBboxReasoner", "SpatialPathReasoner"]:
+                    cls = getattr(sp_sub, cls_name, None) or getattr(sp_mod, cls_name, None)
+                    if cls is None:
+                        continue
+                    original_init = cls.__init__
+                    def make_patched(orig):
+                        def patched(self_sp, gemini_api_key, model=None, *, provider=None, **kwargs):
+                            orig(self_sp, gemini_api_key="cf-placeholder", model=model, provider=cf, **kwargs)
+                        return patched
+                    cls.__init__ = make_patched(original_init)
+        except (AttributeError, ImportError) as e:
+            log.debug(f"Skipping spatial reasoner patch: {e}")
+
+        log.info("Patched hcaptcha-challenger classifiers with CF Workers AI provider")
 
 
 # ──────────────────────────────────────────────
@@ -514,7 +1036,8 @@ class UniversalCaptchaSolver:
     """Unified captcha solver with 2captcha-compatible HTTP API"""
 
     def __init__(self, api_key: str, port: int = 8855, gemini_key: str = "",
-                 cf_api_token: str = "", cf_account_id: str = ""):
+                 cf_api_token: str = "", cf_account_id: str = "",
+                 cf_hcaptcha_model: str = ""):
         self.api_key = api_key
         self.port = port
         self.tasks: Dict[str, CaptchaTask] = {}
@@ -527,14 +1050,20 @@ class UniversalCaptchaSolver:
         self._ddddocr = DdddOcrSolver()
         self._tesseract = TesseractSolver()
         self._vlm_ocr = VlmOcrSolver(cf_api_token=cf_api_token, cf_account_id=cf_account_id)
-        self._hcaptcha = HcaptchaSolver(gemini_key)
+        self._hcaptcha = HcaptchaSolver(
+            gemini_api_key=gemini_key,
+            cf_api_token=cf_api_token,
+            cf_account_id=cf_account_id,
+            cf_model=cf_hcaptcha_model,
+        )
 
         log.info("Universal Captcha Solver initialized")
         log.info(f"  ddddocr: ✅")
         log.info(f"  Tesseract: {'✅' if self._tesseract.available else '❌'}")
         vlm_provider = self._vlm_ocr._provider.upper() if self._vlm_ocr.available else "none"
         log.info(f"  VLM-OCR ({vlm_provider}): {'✅' if self._vlm_ocr.available else '❌ (needs CF_API_TOKEN+CF_ACCOUNT_ID or NVIDIA_API_KEY)'}")
-        log.info(f"  hCaptcha: {'✅' if self._hcaptcha.available else '❌ (needs GEMINI_API_KEY)'}")
+        hc_provider = self._hcaptcha._provider.upper()
+        log.info(f"  hCaptcha ({hc_provider}): {'✅' if self._hcaptcha.available else '❌ (needs GEMINI_API_KEY or CF_API_TOKEN+CF_ACCOUNT_ID)'}")
 
     async def start(self):
         """Start worker tasks"""
@@ -944,8 +1473,10 @@ def create_app(solver: UniversalCaptchaSolver) -> web.Application:
             }, status=400)
 
     async def health(request: web.Request) -> web.Response:
+        hc = solver._hcaptcha
         return web.json_response({
             "status": "ok",
+            "v": "cf-v3-debug",
             "queue": solver._queue.qsize(),
             "solved": solver.solved_count,
             "failed": solver.failed_count,
@@ -955,7 +1486,14 @@ def create_app(solver: UniversalCaptchaSolver) -> web.Application:
                 "tesseract": solver._tesseract.available,
                 "vlm_ocr": solver._vlm_ocr.available,
                 "vlm_provider": solver._vlm_ocr._provider,
-                "hcaptcha": solver._hcaptcha.available,
+                "hcaptcha": hc.available,
+                "hcaptcha_debug": {
+                    "agent_cls": str(hc._agent_cls) if hc._agent_cls else None,
+                    "provider": hc._provider,
+                    "has_cf_token": bool(hc._cf_api_token),
+                    "has_cf_account": bool(hc._cf_account_id),
+                    "has_cf_provider": hc._cf_provider is not None,
+                },
             },
         })
 
@@ -990,8 +1528,9 @@ async def main():
     parser.add_argument("--api-key", required=True, help="API key for authentication")
     parser.add_argument("--port", type=int, default=8855, help="HTTP API port (default: 8855)")
     parser.add_argument("--gemini-key", default="", help="Google Gemini API key for hCaptcha")
-    parser.add_argument("--cf-api-token", default="", help="Cloudflare Workers AI API token (cfut_...)")
-    parser.add_argument("--cf-account-id", default="", help="Cloudflare account ID")
+    parser.add_argument("--cf-api-token", default=os.environ.get("CF_API_TOKEN", os.environ.get("CLOUDFLARE_WORKERS_AI_TOKEN", "")), help="Cloudflare Workers AI API token (cfut_...)")
+    parser.add_argument("--cf-account-id", default=os.environ.get("CF_ACCOUNT_ID", os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")), help="Cloudflare account ID")
+    parser.add_argument("--cf-hcaptcha-model", default="", help="CF Workers AI model for hCaptcha (default: @cf/meta/llama-3.2-11b-vision-instruct)")
     args = parser.parse_args()
 
     solver = UniversalCaptchaSolver(
@@ -1000,6 +1539,7 @@ async def main():
         gemini_key=args.gemini_key,
         cf_api_token=args.cf_api_token,
         cf_account_id=args.cf_account_id,
+        cf_hcaptcha_model=args.cf_hcaptcha_model,
     )
 
     await solver.start()

@@ -1,7 +1,7 @@
 FROM solver-base
 
 # Extra deps for universal solver
-RUN pip install --no-cache-dir hcaptcha-challenger 2>/dev/null || true
+RUN pip install --no-cache-dir pyyaml hcaptcha-challenger playwright-stealth 2>/dev/null || true
 
 COPY . /app/
 
