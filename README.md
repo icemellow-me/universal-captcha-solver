@@ -5,13 +5,13 @@ Self-hosted, 2captcha-compatible captcha solving server. Handles **image OCR**, 
 ## Architecture
 
 ```
-                        ┌─────────────────────────────────┐
-                        │   Universal Solver (:8855)       │
-  POST /in.php ───────►│   ddddocr + Tesseract OCR       │
-  GET  /res.php        │   Cloudflare Workers AI Vision   │
-  POST /solve          │   hcaptcha-challenger + Gemini   │
-                        │   + upstream forwarder           │
-                        └──────┬──────────┬──────────┬───┘
+                        ┌──────────────────────────────────────────┐
+                        │   Universal Solver (:8855)                │
+  POST /in.php ───────►│   ddddocr + Tesseract OCR                │
+  GET  /res.php        │   Cloudflare Workers AI Vision (hCaptcha) │
+  POST /solve          │   hcaptcha-challenger + CF dual-model     │
+                        │   + upstream forwarder                   │
+                        └──────┬──────────┬──────────┬───────────┘
                                │          │          │
                     ┌──────────┘          │          └──────────┐
                     ▼                     ▼                     ▼
@@ -23,6 +23,8 @@ Self-hosted, 2captcha-compatible captcha solving server. Handles **image OCR**, 
 ```
 
 > **OCR Tier System:** ddddocr → Tesseract → **Cloudflare Workers AI Vision** (VLM fallback for hard captchas, math captchas, and xCaptcha)
+
+> **hCaptcha Dual-Model Strategy:** Challenge routing uses the stronger **llama-3.1-70b-instruct** (text-only, better at structured JSON), image classification uses **llama-3.2-11b-vision-instruct** (needs to see images). Automatically falls back when the primary model fails or echoes schemas.
 
 > **Chrome Extension** uses a **separate instance** on port **:8844** (with `json=1` support) that forwards to `:8833` (reCAPTCHA) and `:8822` (Turnstile). See [Extension-Specific Instance](#extension-specific-instance-json1).
 
@@ -46,7 +48,9 @@ GET /health
   "engines": {
     "ddddocr": true,
     "tesseract": true,
-    "hcaptcha": false
+    "hcaptcha": true,
+    "hcaptcha_model": "@cf/meta/llama-3.2-11b-vision-instruct",
+    "hcaptcha_fallback": "@cf/meta/llama-3.1-70b-instruct"
   }
 }
 ```
@@ -233,7 +237,13 @@ curl -X POST http://YOUR_SERVER:8855/in.php \
 
 #### 6. hCaptcha — `method=hcaptcha`
 
-Solves hCaptcha challenges using hcaptcha-challenger + Puter Vision LLM.
+Solves hCaptcha challenges using **hcaptcha-challenger + Cloudflare Workers AI** (dual-model strategy).
+
+**How it works:**
+1. The **70b-instruct** (fallback) model classifies the challenge type (e.g., "image_label_binary")
+2. The **11b-vision** model analyzes the challenge images and selects correct answers
+3. If either model fails or echoes the schema, it auto-retries with a simplified prompt
+4. Solve time: ~96-130 seconds per challenge
 
 | Parameter | Required | Description |
 |---|---|---|
@@ -245,8 +255,8 @@ Solves hCaptcha challenges using hcaptcha-challenger + Puter Vision LLM.
 curl -X POST http://YOUR_SERVER:8855/in.php \
   -d "key=YOUR_API_KEY" \
   -d "method=hcaptcha" \
-  -d "sitekey=a5f74b19-9e45-40e0-b60d-7ba8d4e0" \
-  -d "pageurl=https://example.com/page"
+  -d "sitekey=2880e342-5e8b-4a0c-9c4f-5a253c6d1ee3" \
+  -d "pageurl=https://accounts.hcaptcha.com/demo"
 ```
 
 ---
@@ -429,6 +439,7 @@ docker run -d --name universal-captcha-solver \
 | `API_KEY` | — | Authentication key (also set via `--api-key` flag) |
 | `CF_API_TOKEN` | — | Cloudflare Workers AI token (cfut_... format) |
 | `CF_ACCOUNT_ID` | — | Cloudflare account ID for Workers AI |
+| `CF_HCAPTCHA_FALLBACK_MODEL` | `@cf/meta/llama-3.1-70b-instruct` | Stronger text-only model for challenge routing |
 | `NVIDIA_API_KEY` | — | NVIDIA NIM API key (alternate VLM provider) |
 | `RECAPTCHA_SOLVER_URL` | — | URL of reCAPTCHA v2 solver for forwarding |
 | `TURNSTILE_SOLVER_URL` | — | URL of Turnstile solver for forwarding |
